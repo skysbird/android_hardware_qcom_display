@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -27,36 +27,33 @@
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#ifndef _QDMETADATA_H
+#define _QDMETADATA_H
 
 
-#include <copybit.h>
-#include "gralloc_priv.h"
-#include "gr.h"
+typedef struct {
+    int32_t hue;
+    float   saturation;
+    int32_t intensity;
+    float   contrast;
+} HSICData_t;
 
-#define COPYBIT_SUCCESS 0
-#define COPYBIT_FAILURE -1
+typedef struct {
+    int32_t operation;
+    int32_t interlaced;
+    HSICData_t hsicData;
+    int32_t sharpness;
+    int32_t video_interface;
+} MetaData_t;
 
-int convertYV12toYCrCb420SP(const copybit_image_t *src,private_handle_t *yv12_handle);
+typedef enum {
+    PP_PARAM_HSIC       = 0x0001,
+    PP_PARAM_SHARPNESS  = 0x0002,
+    PP_PARAM_INTERLACED = 0x0004,
+    PP_PARAM_VID_INTFC  = 0x0008
+} DispParamType;
 
-/*
- * Function to convert the c2d format into an equivalent Android format
- *
- * @param: source buffer handle
- * @param: destination image
- *
- * @return: return status
- */
-int convert_yuv_c2d_to_yuv_android(private_handle_t *hnd,
-                                   struct copybit_image_t const *rhs);
+int setMetaData(private_handle_t *handle, DispParamType paramType, void *param);
 
+#endif /* _QDMETADATA_H */
 
-/*
- * Function to convert the Android format into an equivalent C2D format
- *
- * @param: source buffer handle
- * @param: destination image
- *
- * @return: return status
- */
-int convert_yuv_android_to_yuv_c2d(private_handle_t *hnd,
-                                   struct copybit_image_t const *rhs);

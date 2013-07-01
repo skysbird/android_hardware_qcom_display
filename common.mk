@@ -31,8 +31,8 @@ ifeq ($(ARCH_ARM_HAVE_NEON),true)
     common_flags += -D__ARM_HAVE_NEON
 endif
 
-common_deps  :=
-kernel_includes :=
+common_deps  := $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
+kernel_includes := $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
 
 #Kernel includes. Not being executed on JB+
 ifeq ($(call is-vendor-board-platform,QCOM),true)

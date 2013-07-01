@@ -19,6 +19,7 @@
 
 #include "overlayUtils.h"
 #include "overlayRotator.h"
+#define MDSS_MDP_ROT_ONLY 0x80
 
 namespace ovutils = overlay::utils;
 

@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2008 The Android Open Source Project
- * Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved.
+ * Copyright (c) 2011-2013, The Linux Foundation. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,9 @@
 
 #include <hardware/hardware.h>
 #include <hardware/gralloc.h>
+#ifndef QCOM_BSP
 #include <genlock.h>
+#endif
 
 #include <linux/android_pmem.h>
 
@@ -42,6 +44,7 @@
 #include "gr.h"
 #include "alloc_controller.h"
 #include "memalloc.h"
+#include <qdMetaData.h>
 
 using namespace gralloc;
 /*****************************************************************************/
@@ -68,22 +71,29 @@ static int gralloc_map(gralloc_module_t const* module,
         IMemAlloc* memalloc = getAllocator(hnd->flags) ;
         int err = memalloc->map_buffer(&mappedAddress, size,
                                        hnd->offset, hnd->fd);
-        if(err) {
+        if(err || mappedAddress == MAP_FAILED) {
             ALOGE("Could not mmap handle %p, fd=%d (%s)",
                   handle, hnd->fd, strerror(errno));
             hnd->base = 0;
             return -errno;
         }
 
-        if (mappedAddress == MAP_FAILED) {
-            ALOGE("Could not mmap handle %p, fd=%d (%s)",
-                  handle, hnd->fd, strerror(errno));
-            hnd->base = 0;
-            return -errno;
-        }
         hnd->base = intptr_t(mappedAddress) + hnd->offset;
         //LOGD("gralloc_map() succeeded fd=%d, off=%d, size=%d, vaddr=%p",
         //        hnd->fd, hnd->offset, hnd->size, mappedAddress);
+#ifdef QCOM_BSP
+        mappedAddress = MAP_FAILED;
+        size = ROUND_UP_PAGESIZE(sizeof(MetaData_t));
+        err = memalloc->map_buffer(&mappedAddress, size,
+                                       hnd->offset_metadata, hnd->fd_metadata);
+        if(err || mappedAddress == MAP_FAILED) {
+            ALOGE("Could not mmap handle %p, fd=%d (%s)",
+                  handle, hnd->fd_metadata, strerror(errno));
+            hnd->base_metadata = 0;
+            return -errno;
+        }
+        hnd->base_metadata = intptr_t(mappedAddress) + hnd->offset_metadata;
+#endif
     }
     *vaddr = (void*)hnd->base;
     return 0;
@@ -98,13 +108,27 @@ static int gralloc_unmap(gralloc_module_t const* module,
         void* base = (void*)hnd->base;
         size_t size = hnd->size;
         IMemAlloc* memalloc = getAllocator(hnd->flags) ;
-        if(memalloc != NULL)
+        if(memalloc != NULL) {
             err = memalloc->unmap_buffer(base, size, hnd->offset);
-        if (err) {
-            ALOGE("Could not unmap memory at address %p", base);
+            if (err) {
+                ALOGE("Could not unmap memory at address %p", base);
+            }
+#ifdef QCOM_BSP
+            base = (void*)hnd->base_metadata;
+            size = ROUND_UP_PAGESIZE(sizeof(MetaData_t));
+            err = memalloc->unmap_buffer(base, size, hnd->offset_metadata);
+            if (err) {
+                ALOGE("Could not unmap memory at address %p", base);
+            }
+#endif
         }
     }
+    /* need to initialize the pointer to NULL otherwise unmapping for that
+     * buffer happens twice which leads to crash */
     hnd->base = 0;
+#ifdef QCOM_BSP
+    hnd->base_metadata = 0;
+#endif
     return 0;
 }
 
@@ -131,6 +155,9 @@ int gralloc_register_buffer(gralloc_module_t const* module,
 
     private_handle_t* hnd = (private_handle_t*)handle;
     hnd->base = 0;
+#ifdef QCOM_BSP
+    hnd->base_metadata = 0;
+#endif
     void *vaddr;
     int err = gralloc_map(module, handle, &vaddr);
     if (err) {
@@ -138,6 +165,7 @@ int gralloc_register_buffer(gralloc_module_t const* module,
         return err;
     }
 
+#ifndef QCOM_BSP
     // Reset the genlock private fd flag in the handle
     hnd->genlockPrivFd = -1;
 
@@ -156,6 +184,8 @@ int gralloc_register_buffer(gralloc_module_t const* module,
         hnd->base = 0;
         return -EINVAL;
     }
+#endif
+
     return 0;
 }
 
@@ -177,6 +207,9 @@ int gralloc_unregister_buffer(gralloc_module_t const* module,
         gralloc_unmap(module, handle);
     }
     hnd->base = 0;
+#ifdef QCOM_BSP
+    hnd->base_metadata = 0;
+#else
     // Release the genlock
     if (-1 != hnd->genlockHandle) {
         return genlock_release_lock((native_handle_t *)handle);
@@ -184,6 +217,7 @@ int gralloc_unregister_buffer(gralloc_module_t const* module,
         ALOGE("%s: there was no genlock attached to this buffer", __FUNCTION__);
         return -EINVAL;
     }
+#endif
     return 0;
 }
 
@@ -232,6 +266,7 @@ int gralloc_lock(gralloc_module_t const* module,
         }
         *vaddr = (void*)hnd->base;
 
+#ifndef QCOM_BSP
         // Lock the buffer for read/write operation as specified. Write lock
         // has a higher priority over read lock.
         int lockType = 0;
@@ -252,13 +287,23 @@ int gralloc_lock(gralloc_module_t const* module,
             // Mark this buffer as locked for SW read/write operation.
             hnd->flags |= private_handle_t::PRIV_FLAGS_SW_LOCK;
         }
+#endif
 
+        //Invalidate if reading in software. No need to do this for the metadata
+        //buffer as it is only read/written in software.
+        IMemAlloc* memalloc = getAllocator(hnd->flags) ;
+        err = memalloc->clean_buffer((void*)hnd->base,
+                                     hnd->size, hnd->offset, hnd->fd,
+                                     CACHE_INVALIDATE);
         if ((usage & GRALLOC_USAGE_SW_WRITE_MASK) &&
             !(hnd->flags & private_handle_t::PRIV_FLAGS_FRAMEBUFFER)) {
             // Mark the buffer to be flushed after cpu read/write
             hnd->flags |= private_handle_t::PRIV_FLAGS_NEEDS_FLUSH;
         }
+    } else {
+        hnd->flags |= private_handle_t::PRIV_FLAGS_DO_NOT_FLUSH;
     }
+
     return err;
 }
 
@@ -267,19 +312,26 @@ int gralloc_unlock(gralloc_module_t const* module,
 {
     if (private_handle_t::validate(handle) < 0)
         return -EINVAL;
-
+    int err = 0;
     private_handle_t* hnd = (private_handle_t*)handle;
+    IMemAlloc* memalloc = getAllocator(hnd->flags);
 
     if (hnd->flags & private_handle_t::PRIV_FLAGS_NEEDS_FLUSH) {
-        int err;
-        IMemAlloc* memalloc = getAllocator(hnd->flags) ;
         err = memalloc->clean_buffer((void*)hnd->base,
-                                     hnd->size, hnd->offset, hnd->fd);
-        ALOGE_IF(err < 0, "cannot flush handle %p (offs=%x len=%x, flags = 0x%x) err=%s\n",
-                 hnd, hnd->offset, hnd->size, hnd->flags, strerror(errno));
+                                     hnd->size, hnd->offset, hnd->fd,
+                                     CACHE_CLEAN_AND_INVALIDATE);
         hnd->flags &= ~private_handle_t::PRIV_FLAGS_NEEDS_FLUSH;
+    } else if(hnd->flags & private_handle_t::PRIV_FLAGS_DO_NOT_FLUSH) {
+        hnd->flags &= ~private_handle_t::PRIV_FLAGS_DO_NOT_FLUSH;
+    } else {
+        //Probably a round about way to do this, but this avoids adding new
+        //flags
+        err = memalloc->clean_buffer((void*)hnd->base,
+                                     hnd->size, hnd->offset, hnd->fd,
+                                     CACHE_INVALIDATE);
     }
 
+#ifndef QCOM_BSP
     if ((hnd->flags & private_handle_t::PRIV_FLAGS_SW_LOCK)) {
         // Unlock the buffer.
         if (GENLOCK_NO_ERROR != genlock_unlock_buffer((native_handle_t *)handle)) {
@@ -288,7 +340,9 @@ int gralloc_unlock(gralloc_module_t const* module,
         } else
             hnd->flags &= ~private_handle_t::PRIV_FLAGS_SW_LOCK;
     }
-    return 0;
+#endif
+
+    return err;
 }
 
 /*****************************************************************************/
@@ -329,6 +383,31 @@ int gralloc_perform(struct gralloc_module_t const* module,
                 break;
 
             }
+#ifdef QCOM_BSP
+        case GRALLOC_MODULE_PERFORM_UPDATE_BUFFER_GEOMETRY:
+            {
+                int width = va_arg(args, int);
+                int height = va_arg(args, int);
+                int format = va_arg(args, int);
+                private_handle_t* hnd =  va_arg(args, private_handle_t*);
+                if (private_handle_t::validate(hnd)) {
+                    return res;
+                }
+                hnd->width = width;
+                hnd->height = height;
+                hnd->format = format;
+                res = 0;
+            }
+            break;
+#endif
+        case GRALLOC_MODULE_PERFORM_GET_STRIDE:
+            {
+                int width   = va_arg(args, int);
+                int format  = va_arg(args, int);
+                int *stride = va_arg(args, int *);
+                *stride = AdrenoMemInfo::getInstance().getStride(width, format);
+                res = 0;
+            } break;
         default:
             break;
     }

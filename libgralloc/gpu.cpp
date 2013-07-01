@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2010 The Android Open Source Project
- * Copyright (c) 2011-2012 Code Aurora Forum. All rights reserved.
+ * Copyright (c) 2011-2013 The Linux Foundation. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,14 +21,20 @@
 #include <cutils/properties.h>
 #include <sys/mman.h>
 
+#ifndef QCOM_BSP
 #include <genlock.h>
+#endif
 
 #include "gr.h"
 #include "gpu.h"
 #include "memalloc.h"
 #include "alloc_controller.h"
+#include <qdMetaData.h>
+#include "mdp_version.h"
 
 using namespace gralloc;
+
+#define SZ_1M 0x100000
 
 gpu_context_t::gpu_context_t(const private_module_t* module,
                              IAllocController* alloc_ctrl ) :
@@ -43,80 +49,11 @@ gpu_context_t::gpu_context_t(const private_module_t* module,
     common.module  = const_cast<hw_module_t*>(&module->base.common);
     common.close   = gralloc_close;
     alloc          = gralloc_alloc;
+#ifdef QCOM_BSP
+    allocSize      = gralloc_alloc_size;
+#endif
     free           = gralloc_free;
 
-}
-
-int gpu_context_t::gralloc_alloc_framebuffer_locked(size_t size, int usage,
-                                                    buffer_handle_t* pHandle)
-{
-    private_module_t* m = reinterpret_cast<private_module_t*>(common.module);
-
-    // we don't support framebuffer allocations with graphics heap flags
-    if (usage & GRALLOC_HEAP_MASK) {
-        return -EINVAL;
-    }
-
-    if (m->framebuffer == NULL) {
-        ALOGE("%s: Invalid framebuffer", __FUNCTION__);
-        return -EINVAL;
-    }
-
-    const uint32_t bufferMask = m->bufferMask;
-    const uint32_t numBuffers = m->numBuffers;
-    size_t bufferSize = m->finfo.line_length * m->info.yres;
-
-    //adreno needs FB size to be page aligned
-    bufferSize = roundUpToPageSize(bufferSize);
-
-    if (numBuffers == 1) {
-        // If we have only one buffer, we never use page-flipping. Instead,
-        // we return a regular buffer which will be memcpy'ed to the main
-        // screen when post is called.
-        int newUsage = (usage & ~GRALLOC_USAGE_HW_FB) | GRALLOC_USAGE_HW_2D;
-        return gralloc_alloc_buffer(bufferSize, newUsage, pHandle, BUFFER_TYPE_UI,
-                                    m->fbFormat, m->info.xres, m->info.yres);
-    }
-
-    if (bufferMask >= ((1LU<<numBuffers)-1)) {
-        // We ran out of buffers.
-        return -ENOMEM;
-    }
-
-    // create a "fake" handles for it
-    // Set the PMEM flag as well, since adreno
-    // treats the FB memory as pmem
-    intptr_t vaddr = intptr_t(m->framebuffer->base);
-    private_handle_t* hnd = new private_handle_t(dup(m->framebuffer->fd), bufferSize,
-                                                 private_handle_t::PRIV_FLAGS_USES_PMEM |
-                                                 private_handle_t::PRIV_FLAGS_FRAMEBUFFER,
-                                                 BUFFER_TYPE_UI, m->fbFormat, m->info.xres,
-                                                 m->info.yres);
-
-    // find a free slot
-    for (uint32_t i=0 ; i<numBuffers ; i++) {
-        if ((bufferMask & (1LU<<i)) == 0) {
-            m->bufferMask |= (1LU<<i);
-            break;
-        }
-        vaddr += bufferSize;
-    }
-
-    hnd->base = vaddr;
-    hnd->offset = vaddr - intptr_t(m->framebuffer->base);
-    *pHandle = hnd;
-    return 0;
-}
-
-
-int gpu_context_t::gralloc_alloc_framebuffer(size_t size, int usage,
-                                             buffer_handle_t* pHandle)
-{
-    private_module_t* m = reinterpret_cast<private_module_t*>(common.module);
-    pthread_mutex_lock(&m->lock);
-    int err = gralloc_alloc_framebuffer_locked(size, usage, pHandle);
-    pthread_mutex_unlock(&m->lock);
-    return err;
 }
 
 int gpu_context_t::gralloc_alloc_buffer(size_t size, int usage,
@@ -130,52 +67,88 @@ int gpu_context_t::gralloc_alloc_buffer(size_t size, int usage,
     data.offset = 0;
     data.fd = -1;
     data.base = 0;
-    data.size = size;
     if(format == HAL_PIXEL_FORMAT_YCbCr_420_SP_TILED)
         data.align = 8192;
     else
         data.align = getpagesize();
+
+    /* force 1MB alignment selectively for secure buffers, MDP5 onwards */
+    if ((qdutils::MDPVersion::getInstance().getMDPVersion() >= \
+         qdutils::MDSS_V5) && (usage & GRALLOC_USAGE_PROTECTED)) {
+        data.align = ALIGN(data.align, SZ_1M);
+        size = ALIGN(size, data.align);
+    }
+    data.size = size;
     data.pHandle = (unsigned int) pHandle;
     err = mAllocCtrl->allocate(data, usage);
 
-    if (usage & GRALLOC_USAGE_PRIVATE_UNSYNCHRONIZED) {
-        flags |= private_handle_t::PRIV_FLAGS_UNSYNCHRONIZED;
-    }
+    if (!err) {
+#ifdef QCOM_BSP
+        /* allocate memory for enhancement data */
+        alloc_data eData;
+        eData.fd = -1;
+        eData.base = 0;
+        eData.offset = 0;
+        eData.size = ROUND_UP_PAGESIZE(sizeof(MetaData_t));
+        eData.pHandle = data.pHandle;
+        eData.align = getpagesize();
+        int eDataUsage = GRALLOC_USAGE_PRIVATE_SYSTEM_HEAP;
+        int eDataErr = mAllocCtrl->allocate(eData, eDataUsage);
+        ALOGE_IF(eDataErr, "gralloc failed for eDataErr=%s",
+                                          strerror(-eDataErr));
+#endif
 
-    if (usage & GRALLOC_USAGE_PRIVATE_EXTERNAL_ONLY) {
-        flags |= private_handle_t::PRIV_FLAGS_EXTERNAL_ONLY;
-        //The EXTERNAL_BLOCK flag is always an add-on
-        if (usage & GRALLOC_USAGE_PRIVATE_EXTERNAL_BLOCK) {
-            flags |= private_handle_t::PRIV_FLAGS_EXTERNAL_BLOCK;
-        }if (usage & GRALLOC_USAGE_PRIVATE_EXTERNAL_CC) {
-            flags |= private_handle_t::PRIV_FLAGS_EXTERNAL_CC;
+#ifndef QCOM_BSP
+        if (usage & GRALLOC_USAGE_PRIVATE_UNSYNCHRONIZED) {
+            flags |= private_handle_t::PRIV_FLAGS_UNSYNCHRONIZED;
         }
-    }
+#endif
 
-    if (usage & GRALLOC_USAGE_HW_VIDEO_ENCODER ) {
-        flags |= private_handle_t::PRIV_FLAGS_VIDEO_ENCODER;
-    }
+        if (usage & GRALLOC_USAGE_PRIVATE_EXTERNAL_ONLY) {
+            flags |= private_handle_t::PRIV_FLAGS_EXTERNAL_ONLY;
+            //The EXTERNAL_BLOCK flag is always an add-on
+            if (usage & GRALLOC_USAGE_PRIVATE_EXTERNAL_BLOCK) {
+                flags |= private_handle_t::PRIV_FLAGS_EXTERNAL_BLOCK;
+            }
+            if (usage & GRALLOC_USAGE_PRIVATE_EXTERNAL_CC) {
+                flags |= private_handle_t::PRIV_FLAGS_EXTERNAL_CC;
+            }
+        }
 
-    if (usage & GRALLOC_USAGE_HW_CAMERA_WRITE) {
-        flags |= private_handle_t::PRIV_FLAGS_CAMERA_WRITE;
-    }
+        if (usage & GRALLOC_USAGE_HW_VIDEO_ENCODER ) {
+            flags |= private_handle_t::PRIV_FLAGS_VIDEO_ENCODER;
+        }
 
-    if (usage & GRALLOC_USAGE_HW_CAMERA_READ) {
-        flags |= private_handle_t::PRIV_FLAGS_CAMERA_READ;
-    }
+        if (usage & GRALLOC_USAGE_HW_CAMERA_WRITE) {
+            flags |= private_handle_t::PRIV_FLAGS_CAMERA_WRITE;
+        }
 
-    if (err == 0) {
+        if (usage & GRALLOC_USAGE_HW_CAMERA_READ) {
+            flags |= private_handle_t::PRIV_FLAGS_CAMERA_READ;
+        }
+
         flags |= data.allocType;
+#ifdef QCOM_BSP
+        int eBaseAddr = int(eData.base) + eData.offset;
+        private_handle_t *hnd = new private_handle_t(data.fd, size, flags,
+                bufferType, format, width, height, eData.fd, eData.offset,
+                eBaseAddr);
+#else
         private_handle_t* hnd = new private_handle_t(data.fd, size, flags,
-                                                     bufferType, format, width,
-                                                     height);
-
+                bufferType, format, width,
+                height);
+#endif
         hnd->offset = data.offset;
         hnd->base = int(data.base) + data.offset;
+#ifdef QCOM_BSP
+        hnd->gpuaddr = 0;
+#endif
+
         *pHandle = hnd;
     }
 
     ALOGE_IF(err, "gralloc failed err=%s", strerror(-err));
+
     return err;
 }
 
@@ -225,8 +198,7 @@ int gpu_context_t::alloc_impl(int w, int h, int format, int usage,
     // All buffers marked as protected or for external
     // display need to go to overlay
     if ((usage & GRALLOC_USAGE_EXTERNAL_DISP) ||
-        (usage & GRALLOC_USAGE_PROTECTED) ||
-        (usage & GRALLOC_USAGE_PRIVATE_CP_BUFFER)) {
+        (usage & GRALLOC_USAGE_PROTECTED)) {
         bufferType = BUFFER_TYPE_VIDEO;
     }
 
@@ -237,6 +209,7 @@ int gpu_context_t::alloc_impl(int w, int h, int format, int usage,
         return err;
     }
 
+#ifndef QCOM_BSP
     // Create a genlock lock for this buffer handle.
     err = genlock_create_lock((native_handle_t*)(*pHandle));
     if (err) {
@@ -244,31 +217,38 @@ int gpu_context_t::alloc_impl(int w, int h, int format, int usage,
         free_impl(reinterpret_cast<private_handle_t*>(pHandle));
         return err;
     }
+#endif
+
     *pStride = alignedw;
     return 0;
 }
 
 int gpu_context_t::free_impl(private_handle_t const* hnd) {
     private_module_t* m = reinterpret_cast<private_module_t*>(common.module);
-    if (hnd->flags & private_handle_t::PRIV_FLAGS_FRAMEBUFFER) {
-        // free this buffer
-        const size_t bufferSize = m->finfo.line_length * m->info.yres;
-        int index = (hnd->base - m->framebuffer->base) / bufferSize;
-        m->bufferMask &= ~(1<<index);
-    } else {
-        terminateBuffer(&m->base, const_cast<private_handle_t*>(hnd));
-        IMemAlloc* memalloc = mAllocCtrl->getAllocator(hnd->flags);
-        int err = memalloc->free_buffer((void*)hnd->base, (size_t) hnd->size,
-                                        hnd->offset, hnd->fd);
-        if(err)
-            return err;
-    }
 
+    terminateBuffer(&m->base, const_cast<private_handle_t*>(hnd));
+    IMemAlloc* memalloc = mAllocCtrl->getAllocator(hnd->flags);
+    int err = memalloc->free_buffer((void*)hnd->base, (size_t) hnd->size,
+                                    hnd->offset, hnd->fd);
+    if(err)
+        return err;
+#ifdef QCOM_BSP
+    // free the metadata space
+    unsigned long size = ROUND_UP_PAGESIZE(sizeof(MetaData_t));
+    err = memalloc->free_buffer((void*)hnd->base_metadata,
+                                (size_t) size, hnd->offset_metadata,
+                                hnd->fd_metadata);
+    if (err)
+        return err;
+#endif
+
+#ifndef QCOM_BSP
     // Release the genlock
-    int err = genlock_release_lock((native_handle_t*)hnd);
+    err = genlock_release_lock((native_handle_t*)hnd);
     if (err) {
         ALOGE("%s: genlock_release_lock failed", __FUNCTION__);
     }
+#endif
 
     delete hnd;
     return 0;
